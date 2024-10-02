@@ -237,36 +237,6 @@ int main() {
         GetManufactureDate(edidData, week, year);
         std::string monitorName = GetMonitorName(edidData);
 
-        int widthMm = 0, heightMm = 0;
-        if (!GetPhysicalSizeFromEDID(edidData, widthMm, heightMm)) {
-            std::cerr << "Failed to get physical size." << std::endl;
-            continue;
-        }
-
-        int nativeWidth = 0, nativeHeight = 0;
-        if (!GetNativeResolutionFromEDID(edidData, nativeWidth, nativeHeight)) {
-            std::cerr << "Failed to get native resolution." << std::endl;
-            continue;
-        }
-
-        double gamma = 0.0;
-        if (!GetGammaFromEDID(edidData, gamma)) {
-            std::cerr << "Failed to get gamma value." << std::endl;
-            continue;
-        }
-
-        double redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY;
-        if (!GetChromaticityCoordinates(edidData, redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY)) {
-            std::cerr << "Failed to get chromaticity coordinates." << std::endl;
-            continue;
-        }
-
-        double refreshRate = 0.0;
-        if (!GetRefreshRateFromEDID(edidData, refreshRate)) {
-            std::cerr << "Failed to get refresh rate." << std::endl;
-            continue;
-        }
-
         // Display the information
         std::cout << "Monitor Name: " << monitorName << std::endl;
         std::cout << "Manufacturer ID: " << manufacturerId << std::endl;
@@ -275,21 +245,54 @@ int main() {
         std::cout << "Manufacture Week: " << week << std::endl;
         std::cout << "Manufacture Year: " << year << std::endl;
 
-        std::cout << "Native Resolution: " << nativeWidth << "x" << nativeHeight << std::endl;
-        std::cout << "Physical Size: " << widthMm << "mm x " << heightMm << "mm" << std::endl;
+        int nativeWidth = 0, nativeHeight = 0;
+        if (GetNativeResolutionFromEDID(edidData, nativeWidth, nativeHeight)) {
+            std::cout << "Native Resolution: " << nativeWidth << "x" << nativeHeight << std::endl;
+        }
+        else {
+			std::cout << "Native Resolution: UNKNOWN " << std::endl;
+		}
 
-        double pixelPitchWidth = static_cast<double>(widthMm) / nativeWidth;
-        double pixelPitchHeight = static_cast<double>(heightMm) / nativeHeight;
-        std::cout << "Pixel Pitch: " << pixelPitchWidth << "mm x " << pixelPitchHeight << "mm" << std::endl;
+        int widthMm = 0, heightMm = 0;
+        if (GetPhysicalSizeFromEDID(edidData, widthMm, heightMm)) {
+            std::cout << "Physical Size: " << widthMm << " mm x " << heightMm << " mm" << std::endl;
 
-        std::cout << "Refresh Rate: " << refreshRate << " Hz" << std::endl;
+            double pixelPitchWidth = static_cast<double>(widthMm) / nativeWidth;
+            double pixelPitchHeight = static_cast<double>(heightMm) / nativeHeight;
+            std::cout << "Pixel Pitch: " << pixelPitchWidth << " mm x " << pixelPitchHeight << " mm" << std::endl;
+        }
+        else {
+			std::cout << "Physical Size: UNKNOWN" << std::endl;
+            std::cout << "Pixel Pitch: UNKNOWN" << std::endl;
+		}
 
-        std::cout << "Gamma: " << gamma << std::endl;
-        std::cout << "Chromaticity Coordinates:" << std::endl;
-        std::cout << "  Red   x=" << redX << ", y=" << redY << std::endl;
-        std::cout << "  Green x=" << greenX << ", y=" << greenY << std::endl;
-        std::cout << "  Blue  x=" << blueX << ", y=" << blueY << std::endl;
-        std::cout << "  White x=" << whiteX << ", y=" << whiteY << std::endl;
+        double refreshRate = 0.0;
+        if (GetRefreshRateFromEDID(edidData, refreshRate)) {
+            std::cout << "Refresh Rate: " << refreshRate << " Hz" << std::endl;
+        }
+        else {
+			std::cout << "Refresh Rate: UNKNOWN" << std::endl;
+		}
+
+        double gamma = 0.0;
+        if (GetGammaFromEDID(edidData, gamma)) {
+            std::cout << "Gamma: " << gamma << std::endl;
+        }
+		else {
+            std::cout << "Gamma: UNKNOWN" << std::endl;
+        }
+
+        double redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY;
+        if (GetChromaticityCoordinates(edidData, redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY)) {
+            std::cout << "Chromaticity Coordinates:" << std::endl;
+            std::cout << "  Red   x=" << redX << ", y=" << redY << std::endl;
+            std::cout << "  Green x=" << greenX << ", y=" << greenY << std::endl;
+            std::cout << "  Blue  x=" << blueX << ", y=" << blueY << std::endl;
+            std::cout << "  White x=" << whiteX << ", y=" << whiteY << std::endl;
+        }
+        else {
+			std::cout << "Chromaticity Coordinates: UNKNOWN" << std::endl;
+		}
 
         std::cout << "----------------------------------------" << std::endl;
     }
