@@ -1,305 +1,295 @@
 #include <windows.h>
 #include <setupapi.h>
-#include <iostream>
-#include <vector>
-#include <string>
 #include <devguid.h>
-#include <cstdlib>
+#include <cfgmgr32.h>
+
+#include "EdidDetails.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
 
 #pragma comment(lib, "setupapi.lib")
 
-// Function to get Manufacturer ID from EDID
-std::string GetManufacturerID(const BYTE* edidData) {
-    char manufacturerId[4] = { 0 };
-    manufacturerId[0] = ((edidData[8] & 0x7C) >> 2) + 'A' - 1;
-    manufacturerId[1] = (((edidData[8] & 0x03) << 3) | ((edidData[9] & 0xE0) >> 5)) + 'A' - 1;
-    manufacturerId[2] = (edidData[9] & 0x1F) + 'A' - 1;
-    return std::string(manufacturerId);
+using edid::BlockSize;
+using edid::Read16;
+constexpr size_t MaxEdidSize = 256 * BlockSize;
+
+std::uint32_t ReadSerial(const BYTE* bytes)
+{
+    return Read16(bytes) | (std::uint32_t(Read16(bytes + 2)) << 16);
 }
 
-// Function to get Product Code from EDID
-int GetProductCode(const BYTE* edidData) {
-    return edidData[10] | (edidData[11] << 8);
+bool HasValidBase(const std::vector<BYTE>& edid)
+{
+    constexpr BYTE header[] = { 0, 255, 255, 255, 255, 255, 255, 0 };
+    return edid.size() >= BlockSize &&
+        std::equal(header, header + sizeof(header), edid.begin()) &&
+        edid[18] == 1 && edid[19] <= 4 && edid::HasValidChecksum(edid.data());
 }
 
-// Function to get Serial Number from EDID
-int GetSerialNumber(const BYTE* edidData) {
-    return edidData[12] | (edidData[13] << 8) | (edidData[14] << 16) | (edidData[15] << 24);
+bool ApplyOverride(std::vector<BYTE>& edid, unsigned index, const std::vector<BYTE>& block)
+{
+    if (index >= 256 || block.size() != BlockSize)
+        return false;
+
+    const size_t end = (size_t(index) + 1) * BlockSize;
+    if (edid.size() < end)
+        edid.resize(end);
+    std::copy(block.begin(), block.end(), edid.begin() + end - BlockSize);
+    return true;
 }
 
-// Function to get Manufacture Date from EDID
-void GetManufactureDate(const BYTE* edidData, int& week, int& year) {
-    week = edidData[16];
-    year = edidData[17] + 1990; // EDID uses 1990 as base year
+LSTATUS ReadBinary(HKEY key, const wchar_t* name, std::vector<BYTE>& result, DWORD limit)
+{
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DWORD size = 0;
+        DWORD type = 0;
+        LSTATUS status = RegQueryValueExW(key, name, nullptr, &type, nullptr, &size);
+        if (status != ERROR_SUCCESS)
+            return status;
+        if (type != REG_BINARY)
+            return ERROR_DATATYPE_MISMATCH;
+        if (size > limit)
+            return ERROR_INVALID_DATA;
+
+        // Supply a non-null buffer even when the first query reported zero bytes.
+        std::vector<BYTE> bytes((std::max)(size, DWORD{1}));
+        status = RegQueryValueExW(key, name, nullptr, &type, bytes.data(), &size);
+        if (status == ERROR_MORE_DATA)
+            continue;
+        if (status != ERROR_SUCCESS)
+            return status;
+        if (type != REG_BINARY)
+            return ERROR_DATATYPE_MISMATCH;
+        bytes.resize(size);
+        result.swap(bytes);
+        return ERROR_SUCCESS;
+    }
+    return ERROR_MORE_DATA;
 }
 
-// Function to get Monitor Name from EDID
-std::string GetMonitorName(const BYTE* edidData) {
-    for (int i = 0; i < 4; ++i) {
-        int offset = 54 + (i * 18);
-        if (edidData[offset] == 0x00 && edidData[offset + 1] == 0x00 && edidData[offset + 2] == 0x00) {
-            if (edidData[offset + 3] == 0xFC) { // Monitor name descriptor
-                char monitorName[14] = { 0 };
-                memcpy(monitorName, &edidData[offset + 5], 13);
-                // Trim trailing spaces
-                for (int j = 12; j >= 0; --j) {
-                    if (monitorName[j] == ' ' || monitorName[j] == '\n' || monitorName[j] == '\r') {
-                        monitorName[j] = '\0';
-                    }
-                    else {
-                        break;
-                    }
-                }
-                return std::string(monitorName);
+void Report(const std::string& monitor, const char* message, DWORD code)
+{
+    std::cerr << monitor << ": " << message << " (Windows error " << code << ")\n";
+}
+
+bool ApplyRegistryOverrides(HKEY key, const std::string& monitor, std::vector<BYTE>& edid)
+{
+    HKEY overrides;
+    const LSTATUS openStatus = RegOpenKeyExW(key, L"EDID_OVERRIDE", 0, KEY_QUERY_VALUE, &overrides);
+    if (openStatus == ERROR_FILE_NOT_FOUND)
+        return true;
+    if (openStatus != ERROR_SUCCESS) {
+        Report(monitor, "Cannot open EDID_OVERRIDE", openStatus);
+        return false;
+    }
+
+    bool baseOverrideValid = true;
+    for (unsigned index = 0; index < 256; ++index) {
+        const auto name = std::to_wstring(index);
+        std::vector<BYTE> block;
+        const LSTATUS status = ReadBinary(overrides, name.c_str(), block, BlockSize);
+        if (status == ERROR_FILE_NOT_FOUND)
+            continue;
+        if (status != ERROR_SUCCESS || !ApplyOverride(edid, index, block)) {
+            std::cerr << monitor << ": EDID_OVERRIDE block " << index
+                << " is unreadable or invalid (Windows error "
+                << (status == ERROR_SUCCESS ? ERROR_INVALID_DATA : status) << ")\n";
+            if (index == 0)
+                baseOverrideValid = false;
+        }
+    }
+    RegCloseKey(overrides);
+    return baseOverrideValid;
+}
+
+std::string Manufacturer(const BYTE* edid)
+{
+    const unsigned id = (unsigned(edid[8]) << 8) | edid[9];
+    std::string name;
+    for (int shift : {10, 5, 0}) {
+        const unsigned letter = (id >> shift) & 31;
+        if (letter < 1 || letter > 26)
+            return "UNKNOWN";
+        name += static_cast<char>('A' + letter - 1);
+    }
+    return name;
+}
+
+std::string MonitorName(const BYTE* edid)
+{
+    for (int offset = 54; offset <= 108; offset += 18) {
+        const BYTE* descriptor = edid + offset;
+        if (Read16(descriptor) || descriptor[2] || descriptor[3] != 0xfc || descriptor[4])
+            continue;
+
+        std::string name;
+        for (int i = 5; i < 18 && descriptor[i] >= 32 && descriptor[i] <= 126; ++i)
+            name += static_cast<char>(descriptor[i]);
+        const size_t last = name.find_last_not_of(' ');
+        if (last != std::string::npos)
+            return name.substr(0, last + 1);
+    }
+    return "UNKNOWN";
+}
+
+double Coordinate(const BYTE* edid, int index)
+{
+    const unsigned low = (edid[25 + index / 4] >> (6 - 2 * (index % 4))) & 3;
+    return ((unsigned(edid[27 + index]) << 2) | low) / 1024.0;
+}
+
+void PrintEdid(std::ostream& out, const BYTE* edid, const edid::Timing& timing)
+{
+    out << "=== " << MonitorName(edid) << " [" << Manufacturer(edid)
+        << " / " << Read16(edid + 10) << "] ===\n";
+
+    const auto label = [&out](const char* text) -> std::ostream& {
+        return out << std::left << std::setw(25) << text << std::right;
+    };
+    const bool hasTiming = timing.IsValid();
+    label(timing.preferred ? "Preferred mode" : "EDID timing");
+    if (hasTiming)
+        out << timing.Width() << " x " << timing.Height() << (timing.interlaced ? 'i' : 'p')
+            << " @ " << std::fixed << std::setprecision(3) << timing.Rate() << " Hz"
+            << (timing.interlaced ? " (field rate)" : "")
+            << std::defaultfloat << std::setprecision(6);
+    else
+        out << "UNKNOWN";
+    out << '\n';
+
+    int widthMm = edid[21] * 10;
+    int heightMm = edid[22] * 10;
+    if (hasTiming && timing.widthMm && timing.heightMm) {
+        widthMm = timing.widthMm;
+        heightMm = timing.heightMm;
+    }
+    const bool hasSize = widthMm > 0 && heightMm > 0;
+    label("Physical size");
+    if (hasSize)
+        out << widthMm << " x " << heightMm << " mm";
+    else
+        out << "UNKNOWN";
+    out << '\n';
+
+    label("EDID") << unsigned(edid[18]) << '.' << unsigned(edid[19]) << ", "
+        << (edid[20] & 0x80 ? "digital" : "analog") << " input\n";
+    label("Pixel pitch (estimated)");
+    if (hasSize && timing.preferred)
+        out << double(widthMm) / timing.Width() << " x "
+            << double(heightMm) / timing.Height() << " mm";
+    else
+        out << "UNKNOWN";
+    out << '\n';
+
+    label("Serial number") << ReadSerial(edid + 12) << '\n';
+    const int year = edid[17] + 1990;
+    if (edid[19] == 4 && edid[16] == 0xff) {
+        label("Model year") << year << '\n';
+    } else {
+        label("Manufacture year") << year << '\n';
+        label("Manufacture week");
+        if (edid[16] >= 1 && edid[16] <= 54)
+            out << int(edid[16]);
+        else
+            out << "UNKNOWN";
+        out << '\n';
+    }
+
+    label("Gamma");
+    if (edid[23] == 0xff)
+        out << "UNKNOWN";
+    else
+        out << std::fixed << std::setprecision(2) << (edid[23] + 100) / 100.0;
+
+    out << "\n\n[Chromaticity]\n" << std::setw(20) << "x" << std::setw(12) << "y" << '\n'
+        << std::fixed << std::setprecision(6);
+    const char* labels[] = { "Red", "Green", "Blue", "White" };
+    for (int i = 0; i < 4; ++i)
+        out << "  " << std::left << std::setw(6) << labels[i] << std::right
+            << std::setw(12) << Coordinate(edid, i * 2)
+            << std::setw(12) << Coordinate(edid, i * 2 + 1) << '\n';
+    out << std::defaultfloat << std::setprecision(6);
+}
+
+std::string MonitorIdentifier(HDEVINFO devices, SP_DEVINFO_DATA& device, DWORD index)
+{
+    char id[MAX_DEVICE_ID_LEN];
+    if (SetupDiGetDeviceInstanceIdA(devices, &device, id, sizeof(id), nullptr))
+        return id;
+    return "Monitor #" + std::to_string(index + 1);
+}
+
+int main()
+{
+    const HDEVINFO devices = SetupDiGetClassDevsW(&GUID_DEVCLASS_MONITOR, nullptr, nullptr, DIGCF_PRESENT);
+    if (devices == INVALID_HANDLE_VALUE) {
+        Report("Monitor enumeration", "Cannot get device information", GetLastError());
+        return 1;
+    }
+
+    bool displayed = false;
+    DWORD enumError;
+    for (DWORD index = 0; ; ++index) {
+        SP_DEVINFO_DATA device{};
+        device.cbSize = sizeof(device);
+        if (!SetupDiEnumDeviceInfo(devices, index, &device)) {
+            enumError = GetLastError();
+            break;
+        }
+        const auto monitor = MonitorIdentifier(devices, device, index);
+        const HKEY key = SetupDiOpenDevRegKey(
+            devices, &device, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+        if (key == INVALID_HANDLE_VALUE) {
+            Report(monitor, "Cannot open device registry key", GetLastError());
+            continue;
+        }
+
+        std::vector<BYTE> edid;
+        const LSTATUS status = ReadBinary(key, L"EDID", edid, MaxEdidSize);
+        if (status != ERROR_SUCCESS)
+            Report(monitor, "Cannot read EDID", status);
+        const bool overridesValid = ApplyRegistryOverrides(key, monitor, edid);
+        RegCloseKey(key);
+        if (!overridesValid)
+            continue;
+        if (!HasValidBase(edid)) {
+            std::cerr << monitor << ": Invalid or missing EDID base block\n";
+            continue;
+        }
+        std::vector<edid::Timing> timings;
+        for (int offset = 54; offset <= 108; offset += 18) {
+            auto timing = edid::DecodeDtd(edid.data() + offset);
+            if (!timing.clockHz)
+                continue;
+            if (!timing.IsValid()) {
+                std::cerr << monitor << ": Base DTD " << (offset - 54) / 18 + 1
+                    << " is invalid\n";
             }
+            timing.preferred = offset == 54 && (edid[24] & 2) != 0;
+            timings.push_back(timing);
         }
-    }
-    return "Unknown";
-}
-
-// Function to get physical size from EDID
-bool GetPhysicalSizeFromEDID(const BYTE* edidData, int& widthMm, int& heightMm) {
-    if (!edidData) return false;
-
-    widthMm = edidData[21];
-    heightMm = edidData[22];
-
-    if (widthMm == 0 || heightMm == 0) return false;
-
-    widthMm *= 10;
-    heightMm *= 10;
-
-    return true;
-}
-
-// Function to get native resolution from EDID
-bool GetNativeResolutionFromEDID(const BYTE* edidData, int& horizontalResolution, int& verticalResolution) {
-    if (!edidData) return false;
-
-    // Detailed Timing Descriptor (first block)
-    int offset = 54;
-
-    // Pixel clock
-    int pixelClock = edidData[offset] | (edidData[offset + 1] << 8);
-    if (pixelClock == 0) {
-        return false;
+        const auto first = std::find_if(timings.begin(), timings.end(),
+            [](const edid::Timing& timing) { return timing.IsValid(); });
+        PrintEdid(std::cout, edid.data(), first == timings.end() ? edid::Timing{} : *first);
+        std::ostringstream extensions;
+        const int nativeCount = edid::PrintExtensions(
+            extensions, std::cerr, monitor, edid, static_cast<int>(timings.size()));
+        edid::PrintBaseDetails(std::cout, edid.data(), timings, nativeCount);
+        std::cout << extensions.str() << '\n';
+        displayed = true;
     }
 
-    // Horizontal resolution
-    int hActive = ((edidData[offset + 4] & 0xF0) << 4) | edidData[offset + 2];
-    // Vertical resolution
-    int vActive = ((edidData[offset + 7] & 0xF0) << 4) | edidData[offset + 5];
-
-    horizontalResolution = hActive;
-    verticalResolution = vActive;
-
-    return true;
-}
-
-// Function to get gamma from EDID
-bool GetGammaFromEDID(const BYTE* edidData, double& gamma) {
-    if (!edidData) return false;
-
-    BYTE gammaByte = edidData[23];
-    if (gammaByte == 0 || gammaByte == 0xFF) {
-        return false;
+    SetupDiDestroyDeviceInfoList(devices);
+    if (enumError != ERROR_NO_MORE_ITEMS) {
+        Report("Monitor enumeration", "Cannot enumerate devices", enumError);
+        return 1;
     }
-
-    gamma = (gammaByte + 100) / 100.0;
-    return true;
-}
-
-// Function to get chromaticity coordinates from EDID
-bool GetChromaticityCoordinates(const BYTE* edidData, double& redX, double& redY, double& greenX, double& greenY, double& blueX, double& blueY, double& whiteX, double& whiteY) {
-    if (!edidData) return false;
-
-    // Bits [9:8] of each coordinate
-    BYTE rxH = (edidData[25] & 0xC0) >> 6;
-    BYTE ryH = (edidData[25] & 0x30) >> 4;
-    BYTE gxH = (edidData[25] & 0x0C) >> 2;
-    BYTE gyH = (edidData[25] & 0x03);
-    BYTE bxH = (edidData[26] & 0xC0) >> 6;
-    BYTE byH = (edidData[26] & 0x30) >> 4;
-    BYTE wxH = (edidData[26] & 0x0C) >> 2;
-    BYTE wyH = (edidData[26] & 0x03);
-
-    // Bits [7:0] of each coordinate
-    BYTE rxL = edidData[27];
-    BYTE ryL = edidData[28];
-    BYTE gxL = edidData[29];
-    BYTE gyL = edidData[30];
-    BYTE bxL = edidData[31];
-    BYTE byL = edidData[32];
-    BYTE wxL = edidData[33];
-    BYTE wyL = edidData[34];
-
-    // Combine high and low bits
-    redX = ((rxH << 8) | rxL) / 1024.0;
-    redY = ((ryH << 8) | ryL) / 1024.0;
-    greenX = ((gxH << 8) | gxL) / 1024.0;
-    greenY = ((gyH << 8) | gyL) / 1024.0;
-    blueX = ((bxH << 8) | bxL) / 1024.0;
-    blueY = ((byH << 8) | byL) / 1024.0;
-    whiteX = ((wxH << 8) | wxL) / 1024.0;
-    whiteY = ((wyH << 8) | wyL) / 1024.0;
-
-    return true;
-}
-
-// Function to get refresh rate from EDID
-bool GetRefreshRateFromEDID(const BYTE* edidData, double& refreshRate) {
-    if (!edidData) return false;
-
-    // Detailed Timing Descriptor (first block)
-    int offset = 54;
-
-    // Pixel clock in kHz (needs to be multiplied by 10 to get Hz)
-    int pixelClock = (edidData[offset] | (edidData[offset + 1] << 8)) * 10;
-    if (pixelClock == 0) {
-        return false;
-    }
-
-    // Horizontal active pixels and blanking
-    int hActive = ((edidData[offset + 4] & 0xF0) << 4) | edidData[offset + 2];
-    int hBlank = ((edidData[offset + 4] & 0x0F) << 8) | edidData[offset + 3];
-    int hTotal = hActive + hBlank;
-
-    // Vertical active lines and blanking
-    int vActive = ((edidData[offset + 7] & 0xF0) << 4) | edidData[offset + 5];
-    int vBlank = ((edidData[offset + 7] & 0x0F) << 8) | edidData[offset + 6];
-    int vTotal = vActive + vBlank;
-
-    // Refresh rate calculation
-    refreshRate = (pixelClock * 1000.0) / (hTotal * vTotal);
-    return true;
-}
-
-int main() {
-    HDEVINFO hDevInfo = SetupDiGetClassDevsEx(
-        &GUID_DEVCLASS_MONITOR,
-        NULL,
-        NULL,
-        DIGCF_PRESENT,
-        NULL,
-        NULL,
-        NULL
-    );
-
-    if (hDevInfo == INVALID_HANDLE_VALUE) {
-        std::cerr << "Failed to get device information." << std::endl;
-        return -1;
-    }
-
-    SP_DEVINFO_DATA devInfoData;
-    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-
-    DWORD deviceIndex = 0;
-    while (SetupDiEnumDeviceInfo(hDevInfo, deviceIndex, &devInfoData)) {
-        deviceIndex++;
-
-        HKEY hDevRegKey = SetupDiOpenDevRegKey(
-            hDevInfo,
-            &devInfoData,
-            DICS_FLAG_GLOBAL,
-            0,
-            DIREG_DEV,
-            KEY_READ
-        );
-
-        if (hDevRegKey == INVALID_HANDLE_VALUE) {
-            continue;
-        }
-
-        BYTE edidData[1024] = { 0 };
-        DWORD edidSize = sizeof(edidData);
-
-        DWORD regType = 0;
-        LONG retValue = RegQueryValueExA(
-            hDevRegKey,
-            "EDID",
-            NULL,
-            &regType,
-            edidData,
-            &edidSize
-        );
-
-        RegCloseKey(hDevRegKey);
-
-        if (retValue != ERROR_SUCCESS || edidSize == 0) {
-            continue;
-        }
-
-        // Get various information from EDID
-        std::string manufacturerId = GetManufacturerID(edidData);
-        int productCode = GetProductCode(edidData);
-        int serialNumber = GetSerialNumber(edidData);
-        int week = 0, year = 0;
-        GetManufactureDate(edidData, week, year);
-        std::string monitorName = GetMonitorName(edidData);
-
-        // Display the information
-        std::cout << "Monitor Name: " << monitorName << std::endl;
-        std::cout << "Manufacturer ID: " << manufacturerId << std::endl;
-        std::cout << "Product Code: " << productCode << std::endl;
-        std::cout << "Serial Number: " << serialNumber << std::endl;
-        std::cout << "Manufacture Week: " << week << std::endl;
-        std::cout << "Manufacture Year: " << year << std::endl;
-
-        int nativeWidth = 0, nativeHeight = 0;
-        if (GetNativeResolutionFromEDID(edidData, nativeWidth, nativeHeight)) {
-            std::cout << "Native Resolution: " << nativeWidth << "x" << nativeHeight << std::endl;
-        }
-        else {
-			std::cout << "Native Resolution: UNKNOWN " << std::endl;
-		}
-
-        int widthMm = 0, heightMm = 0;
-        if (GetPhysicalSizeFromEDID(edidData, widthMm, heightMm)) {
-            std::cout << "Physical Size: " << widthMm << " mm x " << heightMm << " mm" << std::endl;
-
-            double pixelPitchWidth = static_cast<double>(widthMm) / nativeWidth;
-            double pixelPitchHeight = static_cast<double>(heightMm) / nativeHeight;
-            std::cout << "Pixel Pitch: " << pixelPitchWidth << " mm x " << pixelPitchHeight << " mm" << std::endl;
-        }
-        else {
-			std::cout << "Physical Size: UNKNOWN" << std::endl;
-            std::cout << "Pixel Pitch: UNKNOWN" << std::endl;
-		}
-
-        double refreshRate = 0.0;
-        if (GetRefreshRateFromEDID(edidData, refreshRate)) {
-            std::cout << "Refresh Rate: " << refreshRate << " Hz" << std::endl;
-        }
-        else {
-			std::cout << "Refresh Rate: UNKNOWN" << std::endl;
-		}
-
-        double gamma = 0.0;
-        if (GetGammaFromEDID(edidData, gamma)) {
-            std::cout << "Gamma: " << gamma << std::endl;
-        }
-		else {
-            std::cout << "Gamma: UNKNOWN" << std::endl;
-        }
-
-        double redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY;
-        if (GetChromaticityCoordinates(edidData, redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY)) {
-            std::cout << "Chromaticity Coordinates:" << std::endl;
-            std::cout << "  Red   x=" << redX << ", y=" << redY << std::endl;
-            std::cout << "  Green x=" << greenX << ", y=" << greenY << std::endl;
-            std::cout << "  Blue  x=" << blueX << ", y=" << blueY << std::endl;
-            std::cout << "  White x=" << whiteX << ", y=" << whiteY << std::endl;
-        }
-        else {
-			std::cout << "Chromaticity Coordinates: UNKNOWN" << std::endl;
-		}
-
-        std::cout << "----------------------------------------" << std::endl;
-    }
-
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-
-    system("pause");
-
-    return 0;
+    if (!displayed)
+        std::cerr << "No monitor with a valid EDID was found.\n";
+    return displayed ? 0 : 1;
 }
